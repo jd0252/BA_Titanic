@@ -1,0 +1,630 @@
+---
+title: "Titanic - Machine Learning from Disaster"
+author: '張建鋐、蔡佩蓉、王鈺翔、賴政廷、王政德'
+date: "2021/1/5"
+output: html_document
+---
+
+```{r, message=FALSE, warning=FALSE}
+rm(list=ls());gc()
+
+#Data Wrangling
+#Data Assessment/Visualizations
+pacman::p_load(
+  tidyverse,forcats,stringr,caTools,DT,data.table,pander,ggplot2,
+  scales,grid,gridExtra,corrplot,VIM,knitr,vcd,caret, xgboost,
+  MLmetrics,rpart,rpart.plot,e1071,randomForest,glmnet)
+
+train <- read_csv('Data/train.csv')
+test  <- read_csv('Data/test.csv')
+```
+
+###Prepare and keep data set.
+
+### 報告順序 {.tabset}
+
+#### 資料視覺化(I) {-}
+
+##### 王鈺翔
+
+```{r, message=FALSE, warning=FALSE}
+train$set <- "train"
+test$set  <- "test"
+test$Survived <- NA
+full <- rbind(train, test)
+
+#Check Data
+str(full)
+#Dataset Dimensions
+dim(full)
+#Unique values per column
+lapply(full, function(x) length(unique(x)))
+#Check for Missing values
+missing_values <- full %>% summarize_all(funs(sum(is.na(.))/n()))
+missing_values <- gather(missing_values, key="feature", value="missing_pct")
+missing_values %>%
+  ggplot(aes(x=reorder(feature,-missing_pct),y=missing_pct)) +
+  geom_bar(stat="identity",fill="red")+
+  coord_flip()+theme_bw()
+
+
+full <- full %>%
+  mutate(
+    Age = ifelse(is.na(Age), mean(full$Age, na.rm=TRUE), Age),
+    `Age Group` = case_when(Age < 13 ~ "Age.0012", 
+                            Age >= 13 & Age < 18 ~ "Age.1317",
+                            Age >= 18 & Age < 60 ~ "Age.1859",
+                            Age >= 60 ~ "Age.60Ov"))
+
+full$Embarked <- replace(full$Embarked, which(is.na(full$Embarked)), 'S')
+
+names <- full$Name
+title <-  gsub("^.*, (.*?)\\..*$", "\\1", names)
+full$title <- title
+table(title)
+
+#MISS, Mrs, Master and Mr are taking more numbers
+#Better to group Other titles into bigger basket by checking gender and survival rate to aviod any overfitting
+full$title[full$title == 'Mlle'] <- 'Miss' 
+full$title[full$title == 'Ms'] <- 'Miss'
+full$title[full$title == 'Mme'] <- 'Mrs' 
+full$title[full$title == 'Lady'] <- 'Miss'
+full$title[full$title == 'Dona'] <- 'Miss'
+
+# I am afraid creating a new varible with small data can causes a overfit
+# However, My thinking is that combining below feauter into original variable may loss some predictive power as they are all army folks, doctor and nobel peoples 
+full$title[full$title == 'Capt'] <- 'Officer' 
+full$title[full$title == 'Col'] <- 'Officer' 
+full$title[full$title == 'Major'] <- 'Officer'
+full$title[full$title == 'Dr'] <- 'Officer'
+full$title[full$title == 'Rev'] <- 'Officer'
+full$title[full$title == 'Don'] <- 'Officer'
+full$title[full$title == 'Sir']   <- 'Officer'
+full$title[full$title == 'the Countess'] <- 'Officer'
+full$title[full$title == 'Jonkheer'] <- 'Officer'
+
+full$FamilySize <-full$SibSp + full$Parch + 1 
+full$FamilySized[full$FamilySize == 1] <- 'Single' 
+full$FamilySized[full$FamilySize < 5 & full$FamilySize >= 2] <- 'Small' 
+full$FamilySized[full$FamilySize >= 5] <- 'Big' 
+full$FamilySized=as.factor(full$FamilySized)
+
+#Engineer features based on all the passengers with the same ticket
+ticket.unique <- rep(0, nrow(full))
+tickets <- unique(full$Ticket)
+
+for (i in 1:length(tickets)) {
+  current.ticket <- tickets[i]
+  party.indexes <- which(full$Ticket == current.ticket)
+  
+  for (k in 1:length(party.indexes)) {
+    ticket.unique[party.indexes[k]] <- length(party.indexes)
+  }
+}
+
+full$ticket.unique <- ticket.unique
+
+full$ticket.size[full$ticket.unique == 1] <- 'Single'
+full$ticket.size[full$ticket.unique < 5 & full$ticket.unique>= 2] <- 'Small'
+full$ticket.size[full$ticket.unique >= 5] <- 'Big'
+
+full <- full %>%
+  mutate(Survived = case_when(Survived==1 ~ "Yes", 
+                              Survived==0 ~ "No"))
+
+crude_summary <- full %>%
+  filter(set=="train") %>%
+  select(PassengerId, Survived) %>%
+  group_by(Survived) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n))
+
+crude_survrate <- crude_summary$freq[crude_summary$Survived=="Yes"]
+
+kable(crude_summary, caption="2x2 Contingency Table on Survival.", format="markdown")
+
+ggplot(full %>% filter(set=="train"), aes(Pclass, fill=Survived)) +
+  geom_bar(position = "fill") +
+  scale_fill_brewer(palette="Set1") +
+  scale_y_continuous(labels=percent) +
+  ylab("Survival Rate") +
+  geom_hline(yintercept=crude_survrate, col="white", lty=2, size=2) +
+  ggtitle("Survival Rate by Class") + 
+  theme_minimal()
+
+ggplot(full %>% filter(set=="train"), aes(Pclass, fill=Survived)) +
+  geom_bar(position="stack") +
+  scale_fill_brewer(palette="Set1") +
+  scale_y_continuous(labels=comma) +
+  ylab("Passengers") +
+  ggtitle("Survived by Class") + 
+  theme_minimal()
+
+```
+
+```{r, message=FALSE, warning=FALSE}
+###lets prepare and keep data in the proper format
+feauter1<-full[1:891, c("Pclass", "title","Sex","Embarked","FamilySized","ticket.size")]
+response <- as.factor(train$Survived)
+feauter1$Survived=as.factor(train$Survived)
+###For Cross validation purpose will keep 20% of data aside from my orginal train set
+##This is just to check how well my data works for unseen data
+set.seed(500)
+ind=createDataPartition(feauter1$Survived,times=1,p=0.8,list=FALSE)
+train_val=feauter1[ind,]
+test_val=feauter1[-ind,]
+```
+
+#### 資料視覺化(II) {-}
+
+##### 賴政廷
+
+```{r corrplot, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4, fig.width=9}
+tbl_corr <- full %>%
+  filter(set=="train") %>%
+  select(-PassengerId, -SibSp, -Parch) %>%
+  select_if(is.numeric) %>%
+  cor(use="complete.obs") %>%
+  corrplot.mixed(tl.cex=0.85)
+```
+
+```{r mosaicplot, message=FALSE, warning=FALSE, echo=TRUE, fig.height=4, fig.width=9}
+tbl_mosaic <- full %>%
+  filter(set=="train") %>%
+  select(Survived, Pclass, Sex) %>%
+  mutate_all(as.factor)
+mosaic(~Pclass+Sex+Survived, data=tbl_mosaic, shade=TRUE)
+```
+
+```{r alluvial, message=FALSE, warning=FALSE, echo=TRUE, fig.height=6, fig.width=9}
+library(alluvial)
+tbl_summary <- full %>%
+  filter(set=="train") %>%
+  group_by(Survived, Sex, Pclass, `Age Group`, title) %>%
+  summarise(N = n()) %>% 
+  ungroup %>%
+  na.omit
+alluvial(tbl_summary[, c(1:4)],
+         freq=tbl_summary$N, border=NA,
+         col=ifelse(tbl_summary$Survived == "Yes", "blue", "gray"),
+         cex=0.65)
+```
+
+#### 決策樹、隨機森林&羅吉斯迴歸 {-}
+
+##### 蔡佩蓉
+
+```{r, message=FALSE, warning=FALSE}
+
+#Decison tree
+set.seed(1234)
+#設定隨機數種子
+Model_DT=rpart(Survived~.,data = train_val,method="class")
+#建立決策樹模型，拿train_val 的Survived以外的columns當作input來預測Survived這個Column
+#預測方法:class分類樹，anova迴歸樹
+
+rpart.plot(Model_DT,extra =  2,fallen.leaves = T)
+#決策樹畫模型圖的套件(模型，決定節點上要呈現什麼資訊:2就是number of correct classifications/number of observations in that node，讓樹枝以垂直方式呈現)
+
+PRE_TDT=predict(Model_DT,data=train_val,type="class")
+#(Decision tree 的預測方法，要訓練的資料，預測方式為分類)
+
+confusionMatrix(PRE_TDT,train_val$Survived)
+#confusionMatrix混淆矩陣(訓練的預測結果，目標)
+
+
+PRE_VDTS=predict(Model_DT,newdata=test_val,type="class")
+
+confusionMatrix(PRE_VDTS,test_val$Survived)
+
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Random Forest
+set.seed(1234)
+#設定隨機數種子
+library(randomForest)
+train_val$title = train_val$title %>% as.factor()
+train_val$Sex = train_val$Sex %>% as.factor()
+train_val$Embarked = train_val$Embarked %>% as.factor()
+train_val$ticket.size = train_val$ticket.size %>% as.factor()
+
+
+rf.1 <- randomForest(Survived ~., data = train_val, importance = TRUE, ntree = 1000)
+# importance: 估計出變數的重要性# ntree: 幾顆樹
+#第7格為Survived
+rf.1
+
+varImpPlot(rf.1)
+#畫出重要性圖
+
+#刪除2個不好的變數再重跑一次
+#去掉embarked,familysized 成為新資料
+
+train_val1=train_val[,-4:-5]
+test_val1=test_val[,-4:-5]
+
+set.seed(1234)
+#設定隨機數種子
+rf.2 <- randomForest(Survived ~., data = train_val1, importance = TRUE, ntree = 1000)
+#重跑一次
+rf.2
+varImpPlot(rf.2)
+
+###Lets Predict the test data 
+
+test_val1$title = test_val1$title %>% as.factor()
+test_val1$Sex = test_val1$Sex %>% as.factor()
+test_val1$ticket.size = test_val1$ticket.size %>% as.factor()
+
+pr.rf=predict(rf.2,newdata = test_val1)
+confusionMatrix(pr.rf,test_val1$Survived)
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Logistic Regression
+log.mod <- glm(Survived ~ ., family = binomial(link=logit),
+               data = train_val1)
+#建立羅吉斯迴歸模型
+#廣義線性迴歸模型generalized linear models
+#`family="binomial"` 邏輯迴歸模型，()內為默認的連接函數
+
+#查看結果，看變數係數
+summary(log.mod)
+
+###Predict train data
+
+train.probs <- predict(log.mod, data=train_val1,type =  "response")
+train.class <- ifelse(train.probs>0.5, 1, 0)
+
+confusionMatrix(table(train_val1$Survived,train.class))
+#train.probs值是生存率，>0.5就是存活的部分->設為T，<0.5->F
+
+test.probs <- predict(log.mod, newdata=test_val1,type =  "response")
+test.class <- ifelse(test.probs>0.5, 1, 0)
+
+confusionMatrix(table(test_val1$Survived,test.class))
+```
+
+#### 支持向量機(線性 & 高斯核函數) {-}
+
+##### 張建鋐
+
+```{r}
+liner.svm = svm(Survived~., data=train_val1, kernel="linear",cost=c(0.01,0.1,0.2,0.5,0.7,1,2,3,5,10,15,20,50,100))
+liner.svm
+
+
+##Predict Survival rate using test data
+best.test=predict(liner.svm,newdata=test_val1,type="class")
+confusionMatrix(best.test,test_val1$Survived)
+
+###Linear model accuracy is 0.8079
+set.seed(1274)
+rd.poly = svm(Survived~.,data=train_val1,kernel="radial",gamma=seq(0.1,5))
+summary(rd.poly)
+
+###Non Linear Kerenel giving us a better accuray 
+##Lets Predict test data
+pre.rd=predict(rd.poly,newdata = test_val1)
+confusionMatrix(pre.rd,test_val1$Survived)
+####Accurcay of test data using Non Liner model is 0.8588
+```
+
+#### Lasso, Ridge迴歸 & XGboost {-}
+
+##### 王政德
+
+```{r, message=FALSE, warning=FALSE}
+train_val <- train_val %>%mutate(
+  Survived = case_when(Survived==1 ~ "Yes",
+                       Survived==0 ~ "No"))
+
+train_val<- as.data.frame(train_val)
+train_val$title<-as.factor(train_val$title)
+train_val$Embarked<-as.factor(train_val$Embarked)
+train_val$ticket.size<-as.factor(train_val$ticket.size)
+```
+
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+table(train_val$Survived)
+test_val<- as.data.frame(test_val)
+test_val$title<-as.factor(test_val$title)
+test_val$Embarked<-as.factor(test_val$Embarked)
+test_val$ticket.size<-as.factor(test_val$ticket.size)
+test_val$Survived<-as.factor(test_val$Survived)
+```
+
+
+
+```{r, message=FALSE, warning=FALSE}
+train.male = subset(train_val, train_val$Sex == "male")
+train.female = subset(train_val, train_val$Sex == "female")
+test.male = subset(test_val, test_val$Sex == "male")
+test.female = subset(test_val, test_val$Sex == "female")
+```
+
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+train.male$Sex = NULL
+train.male$title = droplevels(train.male$title)
+train.female$Sex = NULL
+train.female$title = droplevels(train.female$title)
+test.male$Sex = NULL
+test.male$title = droplevels(test.male$title)
+test.female$Sex = NULL
+test.female$title = droplevels(test.female$title)
+
+set.seed(101) 
+train_ind <- sample.split(train.male$Survived, SplitRatio = .75)
+# Male
+cv.train.m <- train.male[train_ind, ]
+cv.test.m  <- train.male[-train_ind, ]
+
+# FEMALE
+set.seed(100)
+train_ind <- sample.split(train.female$Survived, SplitRatio = .75)
+cv.train.f <- train.male[train_ind, ]
+cv.test.f  <- train.male[-train_ind, ]
+x.m = data.matrix(cv.train.m[,1:5])
+y.m = cv.train.m$Survived
+set.seed(356)
+```
+
+##### 男性
+
+```{r, message=FALSE, warning=FALSE}
+# Male
+# 10 fold cross validation
+cvfit.m.ridge = cv.glmnet(
+  x.m, y.m,
+  family = "binomial",
+  alpha = 0,
+  type.measure = "class")
+
+cvfit.m.lasso = cv.glmnet(
+  x.m, y.m,
+  family = "binomial",
+  alpha = 1,
+  type.measure = "class")
+
+par(mfrow=c(1,2))
+plot(cvfit.m.ridge, main = "Ridge")
+plot(cvfit.m.lasso, main = "Lasso")
+coef(cvfit.m.ridge, s = "lambda.min")
+coef(cvfit.m.lasso, s = "lambda.min")
+
+# Prediction on validation set
+PredTest.M.ridge = predict(
+  cvfit.m.ridge,
+  newx=data.matrix(cv.test.m[,1:5]),
+  type="class")
+confusionMatrix(table(cv.test.m$Survived, PredTest.M.ridge))
+PredTest.M.lasso = predict(
+  cvfit.m.lasso,
+  newx=data.matrix(cv.test.m[,1:5]),
+  type="class")
+confusionMatrix(table(cv.test.m$Survived, PredTest.M.lasso))
+```
+
+##### 女性
+
+```{r, message=FALSE, warning=FALSE}
+#female
+x.f = data.matrix(cv.train.f[,1:5])
+y.f = cv.train.f$Survived
+set.seed(356)
+cvfit.f.ridge = cv.glmnet(
+  x.f, y.f,
+  family = "binomial",
+  alpha = 0,
+  type.measure = "class")
+
+cvfit.f.lasso = cv.glmnet(
+  x.f, y.f,
+  family = "binomial",
+  alpha = 1,
+  type.measure = "class")
+
+par(mfrow=c(1,2))
+plot(cvfit.f.ridge, main = "Ridge")
+plot(cvfit.f.lasso, main = "Lasso")
+coef(cvfit.f.ridge, s = "lambda.min")
+coef(cvfit.f.lasso, s = "lambda.min")
+
+# Prediction on validation set
+PredTest.F.ridge = predict(cvfit.f.ridge, newx=data.matrix(cv.test.f[,1:5]), type="class")
+# confusionMatrix(table(cv.test.f$Survived, PredTest.F.ridge))
+table(cv.test.f$Survived, PredTest.F.ridge)
+PredTest.F.lasso = predict(cvfit.f.lasso, newx=data.matrix(cv.test.f[,1:5]), type="class")
+confusionMatrix(table(cv.test.f$Survived, PredTest.F.lasso))
+```
+
+##### Combine Two Model's prediction
+
+```{r, message=FALSE, warning=FALSE}
+# ridge
+MySubmission.F.ridge<-cbind(cv.test.m$Survived, PredTest.M.ridge)
+MySubmission.M.ridge<-cbind(cv.test.f$Survived, PredTest.F.ridge)
+MySubmission.ridge<-rbind(MySubmission.F.ridge,MySubmission.M.ridge)
+
+colnames(MySubmission.ridge) <- c('Actual_Survived', 'predict')
+MySubmission.ridge<- as.data.frame(MySubmission.ridge)
+confusionMatrix(table(MySubmission.ridge))
+
+# lasso
+MySubmission.F.lasso<-cbind(cv.test.m$Survived, PredTest.M.lasso)
+MySubmission.M.lasso<-cbind(cv.test.f$Survived, PredTest.F.lasso)
+MySubmission.lasso<-rbind(MySubmission.F.lasso,MySubmission.M.lasso)
+
+colnames(MySubmission.lasso) <- c('Actual_Survived', 'predict')
+MySubmission.lasso<- as.data.frame(MySubmission.lasso)
+confusionMatrix(table(MySubmission.lasso))
+```
+
+##### XGboost 
+
+```{r, message=FALSE, warning=FALSE}
+library(xgboost)
+library(MLmetrics)
+rm(list = ls())
+
+train <- read_csv('Data/train.csv')
+test  <- read_csv('Data/test.csv')
+```
+
+```{r, message=FALSE, warning=FALSE, include=FALSE}
+train$set <- "train"
+test$set  <- "test"
+test$Survived <- NA
+full <- rbind(train, test)
+full <- full %>%mutate(
+  Age = ifelse(is.na(Age), mean(full$Age, na.rm=TRUE), Age),
+  `Age Group` = case_when(Age < 13 ~ "Age.0012",
+                          Age >= 13 & Age < 18 ~ "Age.1317",
+                          Age >= 18 & Age < 60 ~ "Age.1859",
+                          Age >= 60 ~ "Age.60Ov"))
+
+full$Embarked <- replace(
+  full$Embarked, 
+  which(is.na(full$Embarked)), 'S')
+full <- full %>%mutate(
+  Title = as.factor(str_sub(Name, str_locate(Name, ",")[, 1] + 2,
+                            str_locate(Name, "\\.")[, 1]- 1)))
+full <- full %>% mutate(
+  `Family Size` = as.numeric(SibSp) + as.numeric(Parch) + 1,
+  `Family Group` = case_when(
+    `Family Size`==1 ~ "single",
+    `Family Size`>1 & `Family Size` <=3 ~ "small",
+    `Family Size`>= 4 ~ "large"))
+
+full <- full %>%mutate(
+  Survived = case_when(Survived==1 ~ "Yes",
+                       Survived==0 ~ "No"))
+
+full_2 <- full %>% select(
+  -Name, -Ticket, -Cabin, -set)%>%mutate(
+    Survived = ifelse(Survived=="Yes", 1, 0)) %>%rename(
+      AgeGroup=`Age Group`, FamilySize=`Family Size`,
+      FamilyGroup=`Family Group`)
+
+# OHE
+ohe_cols <- c("Pclass", "Sex", "Embarked", "Title", "AgeGroup", "FamilyGroup")
+num_cols <- setdiff(colnames(full_2), ohe_cols)
+full_final <- subset(full_2, select=num_cols)
+
+for(var in ohe_cols) {
+  values <- unique(full_2[[var]])
+  for(j in 1:length(values)) {
+    full_final[[paste0(var,"_",values[j])]] <- (full_2[[var]] == values[j])*1}}
+
+submission <- TRUE
+data_train <- full_final %>% filter(!is.na(Survived))
+data_test <- full_final %>% filter(is.na(Survived))
+
+set.seed(777)
+ids <- sample(nrow(data_train))
+
+# create folds for cv
+n_folds <- ifelse(submission, 1, 5)
+score <- data.table()
+result <- data.table()
+```
+
+```{r, message=FALSE, warning=FALSE}
+x_train <- data_train %>% select(-PassengerId, -Survived)
+x_test  <- data_test %>% select(-PassengerId, -Survived)
+y_train <- data_train$Survived
+
+##########
+N_train = nrow(x_train)
+train_ind <- sample(N_train, round(0.75*N_train))
+x_train_cv = x_train[train_ind, ]
+x_test_cv  = x_train[-train_ind, ]
+y_train_cv = y_train[train_ind]
+y_test_cv = y_train[-train_ind]
+########
+x_train_cv <- apply(x_train_cv, 2, as.numeric)
+x_test_cv = apply(x_test_cv, 2, as.numeric)
+x_test <- apply(x_test, 2, as.numeric)
+```
+
+```{r, message=FALSE, warning=FALSE}
+nrounds <- 12
+early_stopping_round <- NULL
+dtrain <- xgb.DMatrix(data=as.matrix(x_train_cv), label=y_train_cv)
+dtest <- xgb.DMatrix(data=as.matrix(x_test_cv))
+watchlist <- list(train=dtrain)
+
+params <- list("eta"=0.01,
+               "max_depth"=8,
+               "colsample_bytree"=0.3528,
+               "min_child_weight"=1,
+               "subsample"=1,
+               "objective"="reg:logistic",
+               "eval_metric"="auc")
+```
+
+```{r, message=FALSE, warning=FALSE}
+model_xgb <- xgb.train(params=params,
+                       data=dtrain,
+                       maximize=TRUE,
+                       nrounds=nrounds,
+                       watchlist=watchlist,
+                       early_stopping_round=early_stopping_round,
+                       print_every_n=2)
+pred <- predict(model_xgb, dtest)
+class_xgb <- ifelse(pred > 0.5,1,0)
+confusionMatrix(table(class_xgb, y_test_cv))
+```
+
+#### MLP {-}
+
+
+```{r, message=FALSE, warning=FALSE}
+pacman::p_load(
+  tidyverse,forcats,stringr,caTools,DT,data.table,pander,ggplot2,
+  scales,grid,gridExtra,corrplot,VIM,knitr,vcd,caret, xgboost,
+  MLmetrics,rpart,rpart.plot,e1071,randomForest,glmnet,MLmetrics,keras,caret)
+
+train_x = x_train %>% as.matrix
+train_data_y = y_train %>% as.matrix
+val_x = x_train_cv %>% as.matrix
+val_data_y = y_train_cv %>% as.matrix
+test_x = x_test_cv %>% as.matrix
+test_data_y = y_test_cv %>% as.matrix
+
+keras::k_clear_session()
+model <- keras_model_sequential()%>% 
+  layer_dense(units = 256, activation = 'relu', input_shape = c(ncol(train_x))) %>% 
+  layer_dense(units = 128, activation = 'relu') %>%
+  layer_dense(units = 64, activation = 'relu') %>%
+  layer_dense(units = 32, activation = 'relu') %>%
+  layer_dense(units = 1, activation = 'sigmoid')
+summary(model)
+model %>% compile(
+  loss = 'binary_crossentropy',
+  optimizer = optimizer_adam(),
+  metrics = 'acc'
+)
+# Fit model to data
+history <- fit(  model,
+                 x = train_x,
+                 y = train_data_y,
+                 validation_data = list(val_x,val_data_y),
+                 batch_size = 32,
+                 epochs = 50,
+                 verbose = 1,
+)
+plot(history)
+score <- evaluate(
+  model,
+  x = test_x,
+  y = test_data_y,
+  batch_size = 32
+)
+y_pred <- as.factor(predict_classes(model,test_x))
+y_actual <- as.factor(test_data_y)
+caret::confusionMatrix(y_pred,y_actual)
+```
